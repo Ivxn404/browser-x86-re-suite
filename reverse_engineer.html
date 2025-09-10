@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Browser-Based x86 RE Playground</title>
+  <style>
+    body { background: #121212; color: #eee; font-family: monospace; margin:2em;}
+    h1 { color: #FF9F1C; }
+    .panel { background: #222; padding: 1em; margin-bottom: 1em; border-radius: 7px; }
+    .area { min-height: 120px; white-space: pre; font-family: monospace; font-size: 1em; border: 1px solid #444; background: #181818; color:#00d7c7; padding:0.5em;}
+    #graphviz { background: #212121; }
+    button { margin: 0.5em 0; }
+  </style>
+  <!-- Capstone.js: For x86 Disassembly -->
+  <script src="https://unpkg.com/capstone-wasm/dist/capstone.min.js"></script>
+  <!-- Viz.js: For CFG Rendering -->
+  <script src="https://unpkg.com/viz.js@2.1.2/dist/viz.js"></script>
+</head>
+<body>
+  <h1>x86 Reverse Engineering Suite (Browser Demo)</h1>
+
+  <div class="panel"><b>1. Drag & drop an EXE/DLL (PE file) below:</b>
+    <input type="file" id="fileInput">
+    <div id="fileInfo"></div>
+  </div>
+
+  <div class="panel">
+    <b>2. PE Header:</b>
+    <div id="peHeader" class="area"></div>
+  </div>
+
+  <div class="panel">
+    <b>3. Disassembly (Entry Point, First 64 bytes):</b>
+    <div id="disasm" class="area"></div>
+  </div>
+
+  <div class="panel">
+    <b>4. Control Flow Graph (Entry Function):</b>
+    <div id="graphviz" class="area"></div>
+  </div>
+
+  <div class="panel">
+    <b>5. Emulator (Trace First Few Instructions): <button onclick="stepTrace()">Run Trace</button></b>
+    <div id="emutrace" class="area"></div>
+    <span style="color:#F55;">Note: only simple step-trace, sandboxed & safe (no real code run!)</span>
+  </div>
+
+  <script>
+    // --- Helper: Parse PE Header (Works for most EXE/DLL) ---
+    function parsePE(buffer) {
+      const dv = new DataView(buffer);
+      // DOS Header magic
+      const dosMagic = [dv.getUint8(0), dv.getUint8(1)];
+      if (String.fromCharCode(...dosMagic) !== 'MZ') return {error: "Not a valid PE file (MZ header missing)"};
+      // PE header offset
+      const peOffset = dv.getUint32(0x3C, true);
+      const peSig = [dv.getUint8(peOffset), dv.getUint8(peOffset+1),
+                    dv.getUint8(peOffset+2), dv.getUint8(peOffset+3)];
+      if (String.fromCharCode(...peSig) !== 'PE\x00\x00') return {error: "Not a valid PE signature"};
+      const arch = dv.getUint16(peOffset+4, true) === 0x14c ? "x86 (32-bit)" : "x64/unknown";
+      const secCount = dv.getUint16(peOffset+6, true);
+      const time = dv.getUint32(peOffset+8, true);
+      const epRaw = dv.getUint32(peOffset+0x28, true);
+      const optHdrLen = dv.getUint16(peOffset+0x14, true);
+      // Section Table starts immediately after PE header+optional header
+      const sectionTableOff = peOffset+0x18+optHdrLen;
+      const sections = [];
+      for(let i=0;i<secCount;i++) {
+        const off = sectionTableOff+i*40;
+        const name = String.fromCharCode(...new Uint8Array(buffer, off, 8)).replace(/\0.*/,'');
+        const rawPtr = dv.getUint32(off+20, true);
+        const rawSize = dv.getUint32(off+16, true);
+        const vaddr = dv.getUint32(off+12, true);
+        sections.push({name, rawPtr, rawSize, vaddr});
+      }
+      return {arch, secCount, time, epRaw, sections};
+    }
+
+    let loadedBin = null, epOffset = null, codeBytes = null;
+
+    document.getElementById('fileInput').addEventListener('change', async (ev) => {
+      const file = ev.target.files[0];
+      if (!file) return;
+      const arrayBuffer = await file.arrayBuffer();
+      loadedBin = arrayBuffer;
+      // --- Parse PE Header ---
+      const header = parsePE(arrayBuffer);
+      let headerTxt = '';
+      if (header.error) headerTxt = header.error;
+      else {
+        headerTxt = `Architecture: ${header.arch}\nSections: ${header.secCount}\nEntry point (RAW offset): 0x${header.epRaw.toString(16)}\n`;
+        for (const s of header.sections)
+          headerTxt += `Section ${s.name}: VA 0x${s.vaddr.toString(16)}, RAW 0x${s.rawPtr.toString(16)}, Size 0x${s.rawSize.toString(16)}\n`;
+        epOffset = header.epRaw || 0;
+      }
+      document.getElementById('peHeader').textContent = headerTxt;
+      document.getElementById('fileInfo').innerHTML = `<b>Loaded:</b> ${file.name} (${file.size} bytes)`;
+      // --- Extract first 64 bytes at entry point for disassembly ---
+      if (epOffset !== null) {
+        codeBytes = new Uint8Array(arrayBuffer, epOffset, 64);
+        await disassemble(codeBytes, epOffset);
+      }
+    });
+
+    // --- Capstone.js Disassembly ---
+    async function disassemble(bytes, base=0) {
+      await capstone.ready;
+      const cs = new capstone.Cs(capstone.ARCH_X86, capstone.MODE_32);
+      let disasmTxt = '';
+      let addrs = [];
+      try {
+        const out = cs.disasm(bytes, base, 64);
+        for (let insn of out) {
+          disasmTxt += `${"0x"+(insn.address).toString(16).padStart(8,'0')}: `.padEnd(14) + insn.mnemonic.padEnd(8) + insn.op_str + '\n';
+          addrs.push({addr:insn.address, mnemonic:insn.mnemonic, op:insn.op_str});
+        }
+      } catch(e) {
+        disasmTxt += '[Disassembly Error]\n';
+      }
+      document.getElementById('disasm').textContent = disasmTxt;
+      // Use addresses for simple CFG demo
+      drawCFG(addrs);
+    }
+
+    // --- Minimal Control Flow Graph (CFG) Visualization ---
+    // This is a TOY: detects calls/jmps to visible addrs & renders with Viz.js
+    function drawCFG(instrs) {
+      let nodes = "", edges = "";
+      for (let i=0;i<instrs.length;i++) {
+        const lbl = `${instrs[i].mnemonic} ${instrs[i].op}`;
+        nodes += `N${i}[label="${lbl.replace(/"/g,"'")}"];\n`;
+        if (i>0) edges += `N${i-1} -> N${i};\n`;
+        // Detect jump/call
+        if (/^(call|jmp|je|jne|jz|jnz|ja|jb|jg|jl)/.test(instrs[i].mnemonic)&&instrs[i].op.startsWith('0x')){
+          // Try to find the matching node
+          const tgtI = instrs.findIndex(x=>('0x'+x.addr.toString(16))===instrs[i].op);
+          if (tgtI>=0) edges += `N${i} -> N${tgtI} [color=red];\n`;
+        }
+      }
+      const dot = `digraph G {\nrankdir=LR;\n${nodes}\n${edges}\n}`;
+      const viz = new Viz();
+      viz.renderSVGElement(dot)
+        .then(svg => {document.getElementById('graphviz').innerHTML='';document.getElementById('graphviz').appendChild(svg);})
+        .catch(_ => document.getElementById('graphviz').textContent="CFG render error.");
+    }
+
+    // --- Demo "Emulator": Just Logs Instructions (No Code Run) ---
+    function stepTrace() {
+      if (!codeBytes) { document.getElementById('emutrace').textContent = "Load a binary first."; return; }
+      let trace = "Emulator (step trace):\n";
+      let regs = {EAX:0, EBX:0, ECX:0, EDX:0, EIP: epOffset||0};
+      // VERY minimal make-believe "trace": show first 10 instr (no exec)
+      trace += `EIP: 0x${regs.EIP.toString(16)}\n`;
+      capstone.ready.then(()=>{
+        const cs = new capstone.Cs(capstone.ARCH_X86, capstone.MODE_32);
+        try {
+          const out = cs.disasm(codeBytes, epOffset, 10);
+          for (let insn of out) {
+            trace += `0x${insn.address.toString(16)}: ${insn.mnemonic} ${insn.op_str}\n`;
+            regs.EIP = insn.address+insn.size;
+          }
+        } catch(e) {
+          trace += '[Trace Error]\n';
+        }
+        trace += `[Note: This is a simulated static trace--no code is executed in the browser.]\n`;
+        document.getElementById('emutrace').textContent = trace;
+      });
+    }
+  </script>
+</body>
+</html>
